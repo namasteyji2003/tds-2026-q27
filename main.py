@@ -1,101 +1,114 @@
-import time
-from collections import defaultdict
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from fastapi.middleware.cors import CORSMiddleware
+from collections import defaultdict, deque
+import time
 import logging
 
 app = FastAPI()
 
-# Enable CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["POST"],
-    allow_headers=["*"],
-)
+# -----------------------------
+# Configuration
+# -----------------------------
+RATE_LIMIT = 26           # max per minute
+BURST_LIMIT = 13          # max immediate burst
+WINDOW_SIZE = 60          # seconds
+
+# Store request timestamps per user/IP
+request_store = defaultdict(deque)
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("security")
 
-# ----------------------------
-# Rate Limiting Config
-# ----------------------------
-MAX_REQUESTS_PER_MINUTE = 26
-BURST_LIMIT = 13
-REFILL_RATE = MAX_REQUESTS_PER_MINUTE / 60  # tokens per second
-
-# Token bucket store per user/IP
-rate_limit_store = defaultdict(lambda: {
-    "tokens": BURST_LIMIT,
-    "last_refill": time.time()
-})
-
-# ----------------------------
+# -----------------------------
 # Request Model
-# ----------------------------
+# -----------------------------
 class SecurityRequest(BaseModel):
     userId: str
     input: str
     category: str
 
-# ----------------------------
+
+# -----------------------------
 # Rate Limiting Logic
-# ----------------------------
+# -----------------------------
 def check_rate_limit(identifier: str):
+    now = time.time()
+    window_start = now - WINDOW_SIZE
 
-    bucket = rate_limit_store[identifier]
-    current_time = time.time()
+    timestamps = request_store[identifier]
 
-    # Refill tokens
-    elapsed = current_time - bucket["last_refill"]
-    refill_tokens = elapsed * REFILL_RATE
-    bucket["tokens"] = min(BURST_LIMIT, bucket["tokens"] + refill_tokens)
-    bucket["last_refill"] = current_time
+    # Remove expired timestamps
+    while timestamps and timestamps[0] < window_start:
+        timestamps.popleft()
 
-    if bucket["tokens"] < 1:
-        return False
+    # Check burst first (rapid hits)
+    if len(timestamps) >= BURST_LIMIT and (now - timestamps[-BURST_LIMIT]) < 1:
+        retry_after = 1
+        return False, retry_after
 
-    bucket["tokens"] -= 1
-    return True
+    # Check total per minute
+    if len(timestamps) >= RATE_LIMIT:
+        retry_after = int(WINDOW_SIZE - (now - timestamps[0]))
+        return False, retry_after
 
-# ----------------------------
-# Security Endpoint
-# ----------------------------
-@app.post("/validate")
-async def validate(request: Request, payload: SecurityRequest):
+    timestamps.append(now)
+    return True, None
 
-    identifier = payload.userId or request.client.host
 
-    if not identifier:
-        raise HTTPException(status_code=400, detail="Invalid request")
+# -----------------------------
+# API Endpoint
+# -----------------------------
+@app.post("/security/validate")
+async def validate_security(data: SecurityRequest, request: Request):
 
-    allowed = check_rate_limit(identifier)
+    # Basic input validation
+    if not data.userId or not data.input:
+        raise HTTPException(status_code=400, detail="Invalid request format")
+
+    # Combine userId + IP for stricter tracking
+    client_ip = request.client.host
+    identifier = f"{data.userId}:{client_ip}"
+
+    allowed, retry_after = check_rate_limit(identifier)
 
     if not allowed:
-        logging.warning(f"Rate limit exceeded for {identifier}")
-
-        retry_after = 60
+        logger.warning(f"Rate limit exceeded for {identifier}")
 
         return JSONResponse(
             status_code=429,
+            headers={"Retry-After": str(retry_after)},
             content={
                 "blocked": True,
-                "reason": "Rate limit exceeded. Try again later.",
+                "reason": "Rate limit exceeded",
                 "sanitizedOutput": None,
                 "confidence": 0.99
-            },
-            headers={"Retry-After": str(retry_after)}
+            }
         )
 
-    # If allowed
-    sanitized = payload.input.strip()
+    # If passed
+    logger.info(f"Request allowed for {identifier}")
 
     return {
         "blocked": False,
         "reason": "Input passed all security checks",
-        "sanitizedOutput": sanitized,
+        "sanitizedOutput": data.input.strip(),
         "confidence": 0.95
     }
+
+
+# -----------------------------
+# Global Exception Handler
+# -----------------------------
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error("Unexpected validation error")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "blocked": True,
+            "reason": "Security validation failed",
+            "confidence": 0.75
+        }
+    )
