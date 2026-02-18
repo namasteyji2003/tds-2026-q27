@@ -7,74 +7,73 @@ import logging
 
 app = FastAPI()
 
-# -----------------------------
+# ==============================
 # Configuration
-# -----------------------------
-RATE_LIMIT = 26           # max per minute
-BURST_LIMIT = 13          # max immediate burst
-WINDOW_SIZE = 60          # seconds
+# ==============================
+RATE_LIMIT = 26        # Max per minute
+BURST_LIMIT = 13       # Max burst allowed
+WINDOW_SECONDS = 60
 
 # Store request timestamps per user/IP
-request_store = defaultdict(deque)
+rate_store = defaultdict(deque)
 
-# Logging setup
+# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("security")
 
-# -----------------------------
+# ==============================
 # Request Model
-# -----------------------------
+# ==============================
 class SecurityRequest(BaseModel):
     userId: str
     input: str
     category: str
 
 
-# -----------------------------
-# Rate Limiting Logic
-# -----------------------------
-def check_rate_limit(identifier: str):
-    now = time.time()
-    window_start = now - WINDOW_SIZE
+# ==============================
+# Rate Limit Check
+# ==============================
+def is_rate_limited(identifier: str):
+    current_time = time.time()
+    window_start = current_time - WINDOW_SECONDS
 
-    timestamps = request_store[identifier]
+    timestamps = rate_store[identifier]
 
     # Remove expired timestamps
     while timestamps and timestamps[0] < window_start:
         timestamps.popleft()
 
-    # Check burst first (rapid hits)
-    if len(timestamps) >= BURST_LIMIT and (now - timestamps[-BURST_LIMIT]) < 1:
-        retry_after = 1
-        return False, retry_after
+    # Burst protection (13 rapid requests allowed)
+    if len(timestamps) >= BURST_LIMIT:
+        if current_time - timestamps[-BURST_LIMIT] < 1:
+            return True, 1
 
-    # Check total per minute
+    # 26 per minute limit
     if len(timestamps) >= RATE_LIMIT:
-        retry_after = int(WINDOW_SIZE - (now - timestamps[0]))
-        return False, retry_after
+        retry_after = int(WINDOW_SECONDS - (current_time - timestamps[0]))
+        return True, retry_after
 
-    timestamps.append(now)
-    return True, None
+    timestamps.append(current_time)
+    return False, None
 
 
-# -----------------------------
-# API Endpoint
-# -----------------------------
+# ==============================
+# Endpoint
+# ==============================
 @app.post("/security/validate")
-async def validate_security(data: SecurityRequest, request: Request):
+async def validate(request_data: SecurityRequest, request: Request):
 
-    # Basic input validation
-    if not data.userId or not data.input:
-        raise HTTPException(status_code=400, detail="Invalid request format")
+    # Basic validation
+    if not request_data.userId.strip() or not request_data.input.strip():
+        raise HTTPException(status_code=400, detail="Invalid request payload")
 
-    # Combine userId + IP for stricter tracking
     client_ip = request.client.host
-    identifier = f"{data.userId}:{client_ip}"
+    identifier = f"{request_data.userId}:{client_ip}"
 
-    allowed, retry_after = check_rate_limit(identifier)
+    blocked, retry_after = is_rate_limited(identifier)
 
-    if not allowed:
-        logger.warning(f"Rate limit exceeded for {identifier}")
+    if blocked:
+        logger.warning(f"Rate limit exceeded: {identifier}")
 
         return JSONResponse(
             status_code=429,
@@ -87,23 +86,22 @@ async def validate_security(data: SecurityRequest, request: Request):
             }
         )
 
-    # If passed
-    logger.info(f"Request allowed for {identifier}")
+    logger.info(f"Request allowed: {identifier}")
 
     return {
         "blocked": False,
         "reason": "Input passed all security checks",
-        "sanitizedOutput": data.input.strip(),
+        "sanitizedOutput": request_data.input.strip(),
         "confidence": 0.95
     }
 
 
-# -----------------------------
-# Global Exception Handler
-# -----------------------------
+# ==============================
+# Global Error Handler
+# ==============================
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    logger.error("Unexpected validation error")
+    logger.error("Security validation error occurred")
     return JSONResponse(
         status_code=500,
         content={
